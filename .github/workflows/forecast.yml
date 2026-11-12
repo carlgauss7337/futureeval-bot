@@ -2,8 +2,13 @@ name: Forecast on open tournament questions
 
 on:
   workflow_dispatch:
+    inputs:
+      selfcheck:
+        description: Also check that both Claude models answer here (two small calls)
+        type: boolean
+        default: false
   schedule:
-    - cron: "7,27,47 * * * *" # every 20 minutes, off the hour
+    - cron: "7,27,47 * * * *" # every 20 minutes, off the hour; GitHub may delay or drop these, see the README
 
 permissions:
   contents: read
@@ -29,10 +34,14 @@ jobs:
       - name: Install Claude Code CLI
         if: env.HAS_CLAUDE == 'true'
         run: npm install -g @anthropic-ai/claude-code@2.1.304 # version the flags in bot.py were tested on
-      - name: Run bot on FutureEval (fall 2026) and MiniBench
+      - name: Check that both Claude models answer (manual runs with selfcheck ticked)
+        if: env.HAS_CLAUDE == 'true' && github.event.inputs.selfcheck == 'true'
+        run: bash run.sh --selfcheck
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      - name: Run bot on this season's tournaments
         if: env.HAS_CLAUDE == 'true'
-        run: python bot.py 33121 minibench --limit 6
+        run: bash run.sh # a failed listing or question exits non-zero, so the run shows red
         env:
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          FORECAST_FINAL_MODEL: fable # prizes go to the top few bots; if this model is refused the bot falls back to the research median

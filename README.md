@@ -4,7 +4,7 @@ One file, `bot.py`, Python 3.12, standard library only. Every 20 minutes GitHub 
 questions of the FutureEval tournament and MiniBench, skips those this bot already forecast, researches the
 rest with `claude -p` (web search and fetch only), posts the forecast and a reasoning comment. No LLM API key:
 `claude` authenticates with your Claude subscription token. Fall 2026 FutureEval is id `33121`; change it
-in `.github/workflows/forecast.yml` each season.
+in `run.sh` each season.
 
 ## One-time setup (human steps)
 
@@ -13,24 +13,42 @@ in `.github/workflows/forecast.yml` each season.
 2. On a machine with Claude Code logged in, run `claude setup-token` and copy the token it prints.
 3. Push this folder to a public GitHub repo, then add two repository secrets (Settings, Secrets and variables,
    Actions): `METACULUS_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN`.
-4. Enable Actions for the repo, then run the workflow once by hand (Actions, Forecast..., Run workflow).
+4. Enable Actions for the repo, then run the workflow once by hand with "selfcheck" ticked (Actions, Forecast...,
+   Run workflow). It makes one small call to each model and fails if the Claude login does not work there.
 5. Fill in the participation form linked on the participate page before the bot submits forecasts.
+
+## Do not rely on GitHub's scheduler alone
+
+Questions open at any hour and stay open for only three hours. GitHub runs `schedule` jobs on a best-effort basis:
+they can start hours late or not at all, most of all on a new repository (this one fired no scheduled run in its
+first hours, while manual runs worked). So also call `run.sh` from a scheduler of your own, for example cron:
+
+```
+17,37,57 * * * * METACULUS_TOKEN=... /path/to/run.sh >> /path/to/forecast.log 2>&1
+```
+
+Whichever side runs first posts; the other finds the forecast and skips the question. Check the result, not the
+trigger: `bash run.sh --missed` lists the questions that closed in the last three days without a forecast from
+this bot and exits 1 if there are any. A run that fails to list a tournament or to forecast a question also
+exits 1, so it shows red in Actions.
 
 ## Run locally
 
 ```
 python3 -m unittest test_bot -v                       # tests
 python3 bot.py bot-testing-area --dry-run --limit 1   # forecasts one question, prints, posts nothing
+bash run.sh --selfcheck                               # one small call per model
+bash run.sh --missed                                  # needs METACULUS_TOKEN; read only
 ```
 
-Knobs (env): `FORECAST_RUNS` (3), `FORECAST_RESEARCH_MODEL` (sonnet), `FORECAST_FINAL_MODEL` (opus; the workflow
+Knobs (env): `FORECAST_RUNS` (3), `FORECAST_RESEARCH_MODEL` (sonnet), `FORECAST_FINAL_MODEL` (opus; `run.sh`
 sets fable). Cost: one question = R research runs plus one final call, counted against your subscription's limits.
 
 ## Money and upkeep
 
 - Pool: USD 50k per season, three seasons a year, paid to the top bots (Q4 2024: the top five took 82%). A reasoning
   comment on every forecast and the end-of-season survey are required for prizes; one prize-eligible bot per person.
-- Fall 2026 (id 33121) stops opening questions in mid-December. Change the id in the workflow when Spring 2027 opens
+- Fall 2026 (id 33121) stops opening questions in mid-December. Change the id in `run.sh` when Spring 2027 opens
   (about January).
 - GitHub switches off the schedule of a public repo after 60 days without a commit: push something monthly.
 - MIT licence. The tournament asks makers to share their code; this repository is that.

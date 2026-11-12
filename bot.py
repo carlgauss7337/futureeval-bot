@@ -17,7 +17,7 @@ import urllib.parse
 import urllib.request
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from bisect import bisect_right
 
 SUPPORTED = ("binary", "multiple_choice", "numeric", "discrete")
@@ -35,6 +35,13 @@ def pending(posts):
              if (q := p.get("question")) and q.get("status") == "open"
              and q.get("type") in SUPPORTED and not already_forecast(q)]
     return sorted(found, key=lambda pq: pq[1].get("scheduled_close_time") or "9999")
+
+
+def missed(posts, since):
+    """(n, titles): how many supported single questions closed at or after `since`, and which lack this bot's forecast."""
+    qs = [q for p in posts if (q := p.get("question")) and q.get("status") in ("closed", "resolved")
+          and q.get("type") in SUPPORTED and (q.get("scheduled_close_time") or "") >= since]
+    return len(qs), [q["title"] for q in qs if not (already_forecast(q) or (q.get("my_forecasts") or {}).get("history"))]
 
 
 def interleave(queues, limit):
@@ -285,11 +292,25 @@ def log(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
+def models():
+    """(research model, final model) from the env knobs."""
+    return os.environ.get("FORECAST_RESEARCH_MODEL", "sonnet"), os.environ.get("FORECAST_FINAL_MODEL", "opus")
+
+
+def selfcheck(ask=run_claude):
+    """One small call per model, with the tools a real run gives it. Raises if a model does not answer."""
+    rm, fm = models()
+    # a headline from today can only come from a working web search: read it in the log
+    log(f"{rm}, web tools:", ask("Search the web for one news headline published today. Reply with the headline "
+                                 "and its source, nothing else.", rm, True)[:200])
+    log(f"{fm}, no tools:", ask("Reply with the single word: ok", fm, False)[:200])
+
+
 def forecast(q, ask=run_claude, runs=None, research_model=None, final_model=None, today=None):
     """-> (answer, reasoning). R research runs, one tool-less final call, median fallback."""
     runs = runs or int(os.environ.get("FORECAST_RUNS", 3))
-    rm = research_model or os.environ.get("FORECAST_RESEARCH_MODEL", "sonnet")
-    fm = final_model or os.environ.get("FORECAST_FINAL_MODEL", "opus")
+    rm, fm = models()
+    rm, fm = research_model or rm, final_model or fm
     today = today or date.today().isoformat()
 
     def research(_):
@@ -336,11 +357,11 @@ def api(method, path, token, body=None, params=None):
         raise RuntimeError(f"{method} {path}: {e.code} {e.read()[:300]!r}") from e
 
 
-def pages(tournament, token, size=50):
+def pages(tournament, token, size=50, statuses="open", order="-hotness"):
     for offset in range(0, 10_000, size):
         page = api("GET", "/posts/", token, params={
-            "limit": size, "offset": offset, "order_by": "-hotness", "forecast_type": ",".join(SUPPORTED),
-            "tournaments": [tournament], "statuses": "open", "include_description": "true",
+            "limit": size, "offset": offset, "order_by": order, "forecast_type": ",".join(SUPPORTED),
+            "tournaments": [tournament], "statuses": statuses, "include_description": "true",
             # with_cp makes the list carry my_forecasts; without it every question looks unforecast and is posted again
             "with_cp": "true"})["results"]
         yield page
@@ -353,16 +374,33 @@ def main(argv=None):
     ap.add_argument("tournaments", nargs="+", help="tournament ids or slugs, e.g. 33121 minibench")
     ap.add_argument("--dry-run", action="store_true", help="print what would be posted, post nothing")
     ap.add_argument("--limit", type=int, help="max questions per run")
+    ap.add_argument("--selfcheck", action="store_true", help="only check that both models answer through `claude -p`")
+    ap.add_argument("--missed", action="store_true",
+                    help="only report questions that closed in the last 3 days without this bot's forecast; exit 1 if any")
+    ap.add_argument("--since", default="", help="with --missed: ignore questions that closed before this UTC time, "
+                                                "written like 2026-11-12T21:00:00Z")
     args = ap.parse_args(argv)
+    if args.selfcheck:
+        return selfcheck()
     token = os.environ.get("METACULUS_TOKEN", "")
     if not token and not args.dry_run:
         sys.exit("METACULUS_TOKEN is not set")
+    if args.missed:
+        start = max(args.since, (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        # shortcut: reads the 50 most recently closed questions of each tournament; page further if one ever closes more in 3 days
+        got = [missed(next(pages(t, token, statuses=["closed", "resolved"], order="-scheduled_close_time")), start)
+               for t in args.tournaments]
+        n, lost = sum(g[0] for g in got), [title for g in got for title in g[1]]
+        if lost:
+            sys.exit(f"missed {len(lost)} of {n} questions that closed since {start}: " + "; ".join(lost))
+        return log(f"forecast all {n} questions that closed since {start}")
 
-    queues = []
+    failed, queues = 0, []
     for t in args.tournaments:
         try:
             queues.append(pending([p for page in pages(t, token) for p in page]))
         except Exception as e:
+            failed += 1
             log(f"listing tournament {t} failed: {e!r}")
     for post_id, q in interleave(queues, args.limit):
         try:
@@ -377,7 +415,10 @@ def main(argv=None):
                                                                     "is_private": True, "on_post": post_id}))
             log(f"posted {post_id}: {q['title']}")
         except Exception as e:
+            failed += 1
             log(f"question {post_id} skipped: {e!r}")
+    if failed:  # a non-zero exit turns the scheduled run red, so a broken token or model is not silent
+        sys.exit(f"{failed} failure(s) in this run")
 
 
 if __name__ == "__main__":

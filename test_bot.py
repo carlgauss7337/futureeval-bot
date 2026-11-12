@@ -1,5 +1,6 @@
 import itertools
 import unittest
+from unittest import mock
 
 import bot
 
@@ -378,6 +379,107 @@ class Listing(unittest.TestCase):
         self.assertEqual((method, path), ("GET", "/posts/"))
         self.assertEqual(params["with_cp"], "true")
         self.assertEqual((params["tournaments"], params["statuses"]), (["some-tournament"], "open"))
+
+    def test_listing_can_ask_for_closed_questions_newest_first(self):
+        seen = []
+        api = lambda method, path, token, body=None, params=None: seen.append(params) or {"results": []}
+        with mock.patch.object(bot, "api", api):
+            list(bot.pages("t", "tok", statuses=["closed", "resolved"], order="-scheduled_close_time"))
+        self.assertEqual((seen[0]["statuses"], seen[0]["order_by"]), (["closed", "resolved"], "-scheduled_close_time"))
+
+
+MINE = {"latest": {"forecast_values": [0.3, 0.7]}}
+FAR = "2999-01-01T00:00:00Z"  # a close time inside any "last 3 days" window, whenever the tests run
+
+
+class Missed(unittest.TestCase):
+    def test_counts_closed_questions_since_the_bound_and_names_those_without_a_forecast(self):
+        posts = [post(question(status="closed", title="DONE", scheduled_close_time="2026-11-13T00:00:00Z", my_forecasts=MINE), 1),
+                 post(question(status="resolved", title="LOST", scheduled_close_time="2026-11-13T03:00:00Z"), 2),
+                 post(question(status="closed", title="BEFORE-THE-BOUND", scheduled_close_time="2026-11-12T12:00:00Z"), 3),
+                 post(question(status="open", title="STILL-OPEN", scheduled_close_time="2026-11-13T06:00:00Z"), 4),
+                 post(question("date", status="closed", title="UNSUPPORTED", scheduled_close_time="2026-11-13T03:00:00Z"), 5),
+                 {"id": 6, "group_of_questions": {}}]
+        self.assertEqual(bot.missed(posts, "2026-11-12T21:00:00Z"), (2, ["LOST"]))
+
+    def test_a_forecast_that_is_only_in_the_history_still_counts(self):
+        ended = {"latest": None, "history": [{"forecast_values": [0.3, 0.7]}]}
+        posts = [post(question(status="closed", scheduled_close_time="2026-11-13T00:00:00Z", my_forecasts=ended), 1)]
+        self.assertEqual(bot.missed(posts, "2026-11-12T21:00:00Z"), (1, []))
+
+
+class Selfcheck(unittest.TestCase):
+    def test_asks_each_configured_model_once_with_the_tools_a_real_run_gives_it(self):
+        calls = []
+        with mock.patch.dict(bot.os.environ, {"FORECAST_RESEARCH_MODEL": "haiku", "FORECAST_FINAL_MODEL": "fable"}), \
+                mock.patch.object(bot, "log", lambda *a: None):
+            bot.selfcheck(ask=lambda text, model, tools: calls.append((model, tools)) or "ok")
+        self.assertEqual(calls, [("haiku", True), ("fable", False)])
+
+    def test_a_model_that_does_not_answer_raises(self):
+        def ask(text, model, tools):
+            raise RuntimeError("claude failed")
+
+        with self.assertRaises(RuntimeError):
+            bot.selfcheck(ask=ask)
+
+
+class Run(unittest.TestCase):
+    """main() with the network and the forecaster replaced."""
+
+    def run_main(self, argv, posts, forecast=None, listing_fails=False):
+        self.sent, self.listed = [], []
+
+        def pages(tournament, token, **kw):
+            self.listed.append(kw)
+            if listing_fails:
+                raise RuntimeError("502")
+            yield posts
+
+        def api(method, path, token, body=None, params=None):
+            self.sent.append(path)
+            return {}
+
+        with mock.patch.dict(bot.os.environ, {"METACULUS_TOKEN": "tok"}), mock.patch.object(bot, "pages", pages), \
+                mock.patch.object(bot, "api", api), mock.patch.object(bot, "forecast", forecast), \
+                mock.patch.object(bot, "log", lambda *a: None):
+            bot.main(argv)
+
+    def test_clean_run_posts_the_forecast_and_its_comment_and_returns(self):
+        self.run_main(["t"], [post(question(), 7)], forecast=lambda q: (0.4, "WHY"))
+        self.assertEqual(self.sent, ["/questions/forecast/", "/comments/create/"])
+
+    def test_failed_question_does_not_stop_the_next_and_the_run_exits_nonzero(self):
+        def forecast(q):
+            if q["id"] == 1:
+                raise RuntimeError("all research runs failed")
+            return 0.4, "WHY"
+
+        with self.assertRaises(SystemExit) as stop:
+            self.run_main(["t"], [post(question(id=1), 1), post(question(id=2), 2)], forecast=forecast)
+        self.assertTrue(stop.exception.code)
+        self.assertEqual(self.sent, ["/questions/forecast/", "/comments/create/"])
+
+    def test_failed_listing_exits_nonzero(self):
+        with self.assertRaises(SystemExit) as stop:
+            self.run_main(["t"], [], listing_fails=True)
+        self.assertTrue(stop.exception.code)
+
+    def test_missed_report_names_the_question_exits_nonzero_and_posts_nothing(self):
+        lost = post(question(status="closed", title="LOST-Q", scheduled_close_time=FAR), 1)
+        with self.assertRaises(SystemExit) as stop:
+            self.run_main(["t", "--missed"], [lost])
+        self.assertIn("LOST-Q", str(stop.exception.code))
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.listed, [{"statuses": ["closed", "resolved"], "order": "-scheduled_close_time"}])
+
+    def test_missed_report_returns_when_every_closed_question_was_forecast(self):
+        self.run_main(["t", "--missed"], [post(question(status="closed", scheduled_close_time=FAR, my_forecasts=MINE), 1)])
+        self.assertEqual(self.sent, [])
+
+    def test_missed_report_ignores_questions_that_closed_before_since(self):
+        old = post(question(status="closed", title="OLD-Q", scheduled_close_time="2998-01-01T00:00:00Z"), 1)
+        self.run_main(["t", "--missed", "--since", FAR], [old])
 
 
 if __name__ == "__main__":
