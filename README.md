@@ -72,7 +72,8 @@ sets fable). Cost: one question = R research runs plus one final call, counted a
 
 - Pool: USD 50k per season, three seasons a year, paid to the top bots (Q4 2024: the top five took 82%). A reasoning
   comment on every forecast and the end-of-season survey are required for prizes; one prize-eligible bot per person.
-- Fall 2026 (id 33121) stops opening questions in mid-December. Change the id in `run.sh` when Spring 2027 opens
+- Fall 2026 (id 33121) takes forecasts until 2027-01-06 and closes on 2027-03-05 (dates from the API). Change the
+  id in `run.sh` when Spring 2027 opens
   (about January).
 - GitHub disables the workflow of a public repo after 60 days without a commit, which also ends the chain:
   push something monthly.
