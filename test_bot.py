@@ -1,5 +1,11 @@
 import itertools
+import json
+import os
+import shutil
+import subprocess
+import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import bot
@@ -480,6 +486,128 @@ class Run(unittest.TestCase):
     def test_missed_report_ignores_questions_that_closed_before_since(self):
         old = post(question(status="closed", title="OLD-Q", scheduled_close_time="2998-01-01T00:00:00Z"), 1)
         self.run_main(["t", "--missed", "--since", FAR], [old])
+
+
+# Stand-in for the GitHub CLI. It answers `gh api PATH --jq EXPR` by running the real jq over a JSON file named
+# after the endpoint (a missing file stands for an API error), logs every call, and fails the first FAIL_FIRST
+# dispatches. With LANDS=1 a dispatch reaches GitHub even when it reports an error: the new run is listed from then on.
+FAKE_GH = r"""#!/usr/bin/env bash
+echo "$*" >>"$DIR/calls"
+case "$1 $2" in
+  "api repos/me/bot/actions/runs/100/jobs") f=jobs.json ;;
+  "api repos/me/bot/actions/workflows/forecast.yml") f=workflow.json ;;
+  "api repos/me/bot/actions/workflows/forecast.yml/runs?per_page=30") f=runs.json ;;
+  "workflow run")
+    [ -z "$LANDS" ] || echo '{"workflow_runs": [{"id": 101, "status": "pending"}, {"id": 100, "status": "in_progress"}]}' >"$DIR/runs.json"
+    [ "$(grep -c '^workflow run' "$DIR/calls")" -gt "$FAIL_FIRST" ]
+    exit ;;
+  *) echo "unexpected gh call: $*" >&2; exit 2 ;;
+esac
+[ -e "$DIR/$f" ] || exit 1
+jq -r "$4" "$DIR/$f"
+"""
+ME = {"id": 100, "status": "in_progress"}
+
+
+def ago(seconds):
+    return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@unittest.skipUnless(shutil.which("jq"), "the stand-in gh needs jq")
+class NextRun(unittest.TestCase):
+    """next.sh: every run starts the next one, but only after a real pause, and only one chain survives."""
+
+    def next_run(self, waited=1300, jobs=..., state="active", runs=(ME,), fail_first=0, lands=False):
+        """-> (exit code, output, dispatch calls) of next.sh in run 100, whose forecast job ended `waited` seconds ago.
+        Pass None for jobs, state or runs to make that API call fail."""
+        if jobs is ...:
+            jobs = [{"name": "forecast", "status": "completed", "completed_at": ago(waited)},
+                    {"name": "next", "status": "in_progress", "completed_at": None}]
+        files = {"jobs.json": jobs is not None and {"jobs": jobs}, "workflow.json": state is not None and {"state": state},
+                 "runs.json": runs is not None and {"workflow_runs": list(runs)}}
+        with tempfile.TemporaryDirectory() as d:
+            for name, content in files.items():
+                if content:
+                    with open(os.path.join(d, name), "w") as f:
+                        json.dump(content, f)
+            with open(os.path.join(d, "gh"), "w") as f:
+                f.write(FAKE_GH)
+            os.chmod(os.path.join(d, "gh"), 0o755)
+            env = {"PATH": d + os.pathsep + os.environ["PATH"], "DIR": d, "GITHUB_REPOSITORY": "me/bot",
+                   "GITHUB_RUN_ID": "100", "GITHUB_REF_NAME": "side-branch", "DEFAULT_BRANCH": "main",
+                   "RETRY_WAIT": "0", "FAIL_FIRST": str(fail_first), "LANDS": "1" if lands else ""}
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "next.sh")
+            r = subprocess.run(["bash", script], env=env, capture_output=True, text=True, timeout=60)
+            calls = []
+            if os.path.exists(os.path.join(d, "calls")):  # absent when the script never reached gh
+                with open(os.path.join(d, "calls")) as f:
+                    calls = [c for c in f.read().splitlines() if c.startswith("workflow run")]
+        return r.returncode, r.stdout + r.stderr, calls
+
+    def test_starts_the_next_run_on_the_default_branch_after_the_pause(self):
+        code, _, calls = self.next_run(waited=1300)
+        self.assertEqual((code, calls), (0, ["workflow run forecast.yml --repo me/bot --ref main"]))
+
+    def test_refuses_when_the_job_did_not_wait_however_long_the_run_took(self):
+        # no wait timer on the environment: runs would follow each other without a pause.
+        # The first job ended long ago, as in a run whose forecast took an hour: only the last job's end counts.
+        jobs = [{"name": "setup", "status": "completed", "completed_at": ago(4000)},
+                {"name": "forecast", "status": "completed", "completed_at": ago(40)},
+                {"name": "next", "status": "in_progress", "completed_at": None}]
+        code, out, calls = self.next_run(jobs=jobs)
+        self.assertEqual((code, calls), (1, []))
+        self.assertIn("wait timer", out)
+
+    def test_starts_nothing_when_the_end_of_the_forecast_cannot_be_read(self):
+        # `date -d ""` is today's midnight, which would look like a long pause
+        unfinished = [{"name": "forecast", "status": "in_progress", "completed_at": None}]
+        blank = [{"name": "forecast", "status": "completed", "completed_at": ""}]
+        for jobs in (None, [], unfinished, blank):
+            code, _, calls = self.next_run(jobs=jobs)
+            self.assertEqual((code, calls), (1, []), jobs)
+
+    def test_leaves_the_chain_to_a_newer_unfinished_run(self):
+        for status in ("queued", "pending", "waiting", "in_progress", "requested"):
+            code, out, calls = self.next_run(runs=[{"id": 101, "status": status}, ME])
+            self.assertEqual((code, calls), (0, []), status)
+            self.assertIn("newer run", out)
+
+    def test_a_newer_finished_run_or_an_older_unfinished_one_does_not_carry_the_chain(self):
+        runs = [{"id": 102, "status": "completed"}, ME, {"id": 99, "status": "waiting"}]
+        code, _, calls = self.next_run(runs=runs)
+        self.assertEqual((code, len(calls)), (0, 1))
+
+    def test_starts_nothing_when_the_run_list_cannot_be_read(self):
+        code, _, calls = self.next_run(runs=None)
+        self.assertEqual((code, calls), (1, []))
+
+    def test_ends_the_chain_when_the_workflow_is_disabled(self):
+        code, out, calls = self.next_run(state="disabled_manually")
+        self.assertEqual((code, calls), (0, []))
+        self.assertIn("disabled_manually", out)
+        self.assertNotIn("::warning::", out)
+
+    def test_warns_when_github_disabled_the_workflow_itself(self):
+        code, out, calls = self.next_run(state="disabled_inactivity")
+        self.assertEqual((code, calls), (0, []))
+        self.assertIn("::warning::", out)
+
+    def test_starts_nothing_when_the_workflow_state_cannot_be_read(self):
+        code, _, calls = self.next_run(state=None)
+        self.assertEqual((code, calls), (1, []))
+
+    def test_tries_again_when_starting_the_run_fails(self):
+        code, _, calls = self.next_run(fail_first=2)
+        self.assertEqual((code, len(calls)), (0, 3))
+
+    def test_gives_up_with_an_error_when_the_run_never_starts(self):
+        code, _, calls = self.next_run(fail_first=99)
+        self.assertEqual((code, len(calls)), (1, 5))
+
+    def test_does_not_start_a_second_run_when_the_first_start_reported_an_error_but_arrived(self):
+        code, out, calls = self.next_run(fail_first=1, lands=True)
+        self.assertEqual((code, len(calls)), (0, 1))
+        self.assertIn("newer run", out)
 
 
 if __name__ == "__main__":
